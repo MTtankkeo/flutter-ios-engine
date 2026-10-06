@@ -76,12 +76,18 @@ def prepare(sync=False):
 def build():
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise RuntimeError("Build requires an Apple Silicon Mac with Xcode")
+    # Use the Ninja pinned by Flutter's DEPS. The depot_tools PATH wrapper
+    # depends on separate Python bootstrap state and is not the engine binary.
+    ninja = FLUTTER / "third_party/ninja/ninja"
+    if not ninja.is_file() or not os.access(ninja, os.X_OK):
+        raise RuntimeError(f"Missing executable {ninja}; run prepare first")
+    run(ninja, "--version", cwd=SRC)
     run(SRC / "flutter/tools/gn", "--runtime-mode=release", "--mac-cpu=arm64",
         "--no-prebuilt-dart-sdk", "--no-lto", cwd=SRC)
-    run("ninja", "-C", "out/" + HOST, "-j2", cwd=SRC)
+    run(ninja, "-C", "out/" + HOST, "-j2", cwd=SRC)
     run(SRC / "flutter/tools/gn", "--ios", "--runtime-mode=release",
         "--no-lto", cwd=SRC)
-    run("ninja", "-C", "out/" + TARGET, "-j2", cwd=SRC)
+    run(ninja, "-C", "out/" + TARGET, "-j2", cwd=SRC)
 
 
 def copy(source, destination):

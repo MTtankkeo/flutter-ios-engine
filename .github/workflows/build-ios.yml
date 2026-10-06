@@ -1,5 +1,10 @@
 name: Build and release iOS engine
 on:
+  push:
+    branches: [main]
+    paths:
+      - build-config.json
+      - patches/**
   workflow_dispatch:
     inputs:
       publish:
@@ -40,7 +45,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
       - name: Publish immutable release
-        if: inputs.publish
+        if: github.event_name == 'push' || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

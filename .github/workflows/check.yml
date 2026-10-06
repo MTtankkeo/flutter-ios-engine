@@ -12,6 +12,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check scripts
         run: python3 -m py_compile scripts/engine.py
+      - name: Check pinned build tool selection
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Apply patch to pinned official stable
         env:
           GITHUB_TOKEN: ${{ github.token }}

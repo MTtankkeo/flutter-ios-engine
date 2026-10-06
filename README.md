@@ -4,7 +4,7 @@
 
 ## 엔진 만들기
 
-1. **Actions → Build and release iOS engine → Run workflow**를 누릅니다.
+1. `build-config.json` 또는 `patches/`를 수정하고 `main`에 push하면 자동으로 시작됩니다. 수동 재실행은 **Actions → Build and release iOS engine → Run workflow**를 사용합니다.
 2. 빌드와 샘플 앱 빌드가 성공하면 **Releases**에 엔진이 올라옵니다.
 3. 기본 버전은 **Flutter 3.47.6**, 패치 버전은 **1**입니다.
 
