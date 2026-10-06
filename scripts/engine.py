@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import tarfile
@@ -34,14 +35,17 @@ def revision():
 
 def prepare(sync=False):
     version = CONFIG["flutter_version"]
-    with urllib.request.urlopen(
-        "https://storage.googleapis.com/flutter_infra_release/flutter/releases/releases_macos.json",
-        timeout=60,
-    ) as response:
-        releases = json.load(response)["releases"]
-    if not any(r["channel"] == "stable" and r["version"] == version
-               and r["hash"] == CONFIG["flutter_commit"] for r in releases):
-        raise RuntimeError("Pinned version/commit is not an official stable release")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise RuntimeError("Use an exact stable version, without a prerelease suffix")
+    request = urllib.request.Request(
+        "https://api.github.com/repos/flutter/flutter/compare/"
+        + CONFIG["flutter_commit"] + "...stable",
+        headers={"User-Agent": "flutter-ios-engine", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        comparison = json.load(response)
+    if comparison["status"] not in ("ahead", "identical"):
+        raise RuntimeError("Pinned commit is not on the official stable history")
     WORK.mkdir(exist_ok=True)
     if FLUTTER.exists():
         raise RuntimeError("Use a fresh .work directory; refusing to replace an existing checkout")
