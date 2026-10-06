@@ -1,4 +1,4 @@
-name: Check stable patch
+name: Check release patch
 on:
   push:
   pull_request:
@@ -11,10 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check scripts
-        run: python3 -m py_compile scripts/engine.py
-      - name: Check pinned build tool selection
+        run: python3 -m compileall -q scripts
+      - name: Test release selection and build artifacts
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
-      - name: Apply patch to pinned official stable
+      - name: Apply patch to configured official release
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/engine.py check

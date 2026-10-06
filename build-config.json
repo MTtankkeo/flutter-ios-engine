@@ -1,4 +1,5 @@
 {
+  "flutter_channel": "stable",
   "flutter_version": "3.47.6",
   "flutter_commit": "5fc346839b5d0eef006ed8404392afb4dfae428d",
   "patch_version": "1",

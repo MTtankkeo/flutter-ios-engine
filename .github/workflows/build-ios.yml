@@ -7,6 +7,19 @@ on:
       - patches/**
   workflow_dispatch:
     inputs:
+      channel:
+        description: Flutter release channel
+        type: choice
+        options:
+          - stable
+          - beta
+        default: stable
+        required: true
+      flutter_version:
+        description: Exact Flutter version (beta requires its full .pre version)
+        type: string
+        default: '3.47.6'
+        required: true
       publish:
         description: Publish a GitHub Release after the smoke build succeeds
         type: boolean
@@ -24,13 +37,17 @@ jobs:
       contents: write
     env:
       DEPOT_TOOLS_UPDATE: '0'
+      FLUTTER_CHANNEL: ${{ inputs.channel || '' }}
+      FLUTTER_VERSION: ${{ inputs.flutter_version || '' }}
     steps:
       - uses: actions/checkout@v4
+      - name: Validate build scripts
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Install depot_tools
         run: |
           git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
           echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
-      - name: Prepare stable source and apply patch
+      - name: Prepare selected release and apply patch
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/engine.py prepare
@@ -51,5 +68,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG=$(python3 -c 'import json; c=json.load(open("build-config.json")); print("flutter-" + c["flutter_version"] + "-ios-latency." + c["patch_version"])')
+          TAG=$(python3 scripts/engine.py release-tag)
           gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --notes-file RELEASE-NOTES.md
