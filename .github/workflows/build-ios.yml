@@ -1,0 +1,46 @@
+name: Build and release iOS engine
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub Release after the smoke build succeeds
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: ios-engine-release
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    env:
+      DEPOT_TOOLS_UPDATE: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install depot_tools
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+      - name: Prepare stable source and apply patch
+        run: python3 scripts/engine.py prepare
+      - name: Build iOS and matching host engine
+        run: python3 scripts/engine.py build
+      - name: Package and build unsigned smoke app with packaged engine
+        run: python3 scripts/engine.py package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flutter-ios-engine
+          path: dist/*
+          compression-level: 0
+          if-no-files-found: error
+      - name: Publish immutable release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(python3 -c 'import json; c=json.load(open("build-config.json")); print("flutter-" + c["flutter_version"] + "-ios-latency." + c["patch_version"])')
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --notes-file RELEASE-NOTES.md

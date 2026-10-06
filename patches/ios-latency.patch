@@ -1,0 +1,1647 @@
+diff --git a/engine/src/flutter/fml/message_loop_impl.cc b/engine/src/flutter/fml/message_loop_impl.cc
+index 01f4d58..969a847 100644
+--- a/engine/src/flutter/fml/message_loop_impl.cc
++++ b/engine/src/flutter/fml/message_loop_impl.cc
+@@ -115,32 +115,30 @@ void MessageLoopImpl::DoTerminate() {
+   Terminate();
+ }
+ 
+-void MessageLoopImpl::FlushTasks(FlushType type) {
++void MessageLoopImpl::RunTask(const fml::closure& task,
++                              const std::vector<fml::closure>& observers) {
++  task();
++  for (const auto& observer : observers) {
++    observer();
++  }
++}
++
++void MessageLoopImpl::FlushTasks() {
+   const auto now = fml::TimePoint::Now();
+   fml::closure invocation;
+-  do {
++  while (true) {
+     invocation = task_queue_->GetNextTaskToRun(queue_id_, now);
+     if (!invocation) {
+       break;
+     }
+-    invocation();
+     std::vector<fml::closure> observers =
+         task_queue_->GetObserversToNotify(queue_id_);
+-    for (const auto& observer : observers) {
+-      observer();
+-    }
+-    if (type == FlushType::kSingle) {
+-      break;
+-    }
+-  } while (invocation);
++    RunTask(invocation, observers);
++  }
+ }
+ 
+ void MessageLoopImpl::RunExpiredTasksNow() {
+-  FlushTasks(FlushType::kAll);
+-}
+-
+-void MessageLoopImpl::RunSingleExpiredTaskNow() {
+-  FlushTasks(FlushType::kSingle);
++  FlushTasks();
+ }
+ 
+ TaskQueueId MessageLoopImpl::GetTaskQueueId() const {
+diff --git a/engine/src/flutter/fml/message_loop_impl.h b/engine/src/flutter/fml/message_loop_impl.h
+index 270cc3c..d1f103a 100644
+--- a/engine/src/flutter/fml/message_loop_impl.h
++++ b/engine/src/flutter/fml/message_loop_impl.h
+@@ -11,6 +11,7 @@
+ #include <mutex>
+ #include <queue>
+ #include <utility>
++#include <vector>
+ 
+ #include "flutter/fml/closure.h"
+ #include "flutter/fml/delayed_task.h"
+@@ -58,9 +59,9 @@ class MessageLoopImpl : public Wakeable,
+ 
+   void RunExpiredTasksNow();
+ 
+-  void RunSingleExpiredTaskNow();
++  virtual void RunTask(const fml::closure& task,
++                       const std::vector<fml::closure>& observers);
+ 
+- protected:
+   MessageLoopImpl();
+ 
+  private:
+@@ -69,7 +70,7 @@ class MessageLoopImpl : public Wakeable,
+ 
+   std::atomic_bool terminated_;
+ 
+-  void FlushTasks(FlushType type);
++  void FlushTasks();
+ 
+   FML_DISALLOW_COPY_AND_ASSIGN(MessageLoopImpl);
+ };
+diff --git a/engine/src/flutter/fml/platform/darwin/message_loop_darwin.h b/engine/src/flutter/fml/platform/darwin/message_loop_darwin.h
+index fb43ca5..fed7271 100644
+--- a/engine/src/flutter/fml/platform/darwin/message_loop_darwin.h
++++ b/engine/src/flutter/fml/platform/darwin/message_loop_darwin.h
+@@ -40,6 +40,10 @@ class MessageLoopDarwin : public MessageLoopImpl {
+   // |fml::MessageLoopImpl|
+   void WakeUp(fml::TimePoint time_point) override;
+ 
++  // |fml::MessageLoopImpl|
++  void RunTask(const fml::closure& task,
++               const std::vector<fml::closure>& observers) override;
++
+   static void OnTimerFire(CFRunLoopTimerRef timer, MessageLoopDarwin* loop);
+ 
+   FML_FRIEND_MAKE_REF_COUNTED(MessageLoopDarwin);
+diff --git a/engine/src/flutter/fml/platform/darwin/message_loop_darwin.mm b/engine/src/flutter/fml/platform/darwin/message_loop_darwin.mm
+index d48cf33..c893f9b 100644
+--- a/engine/src/flutter/fml/platform/darwin/message_loop_darwin.mm
++++ b/engine/src/flutter/fml/platform/darwin/message_loop_darwin.mm
+@@ -79,11 +79,16 @@ void MessageLoopDarwin::WakeUp(fml::TimePoint time_point) {
+       CFAbsoluteTimeGetCurrent() + (time_point - fml::TimePoint::Now()).ToSecondsF());
+ }
+ 
+-void MessageLoopDarwin::OnTimerFire(CFRunLoopTimerRef timer, MessageLoopDarwin* loop) {
++void MessageLoopDarwin::RunTask(const fml::closure& task,
++                                const std::vector<fml::closure>& observers) {
+   @autoreleasepool {
+-    // RunExpiredTasksNow rearms the timer as appropriate via a call to WakeUp.
+-    loop->RunExpiredTasksNow();
++    MessageLoopImpl::RunTask(task, observers);
+   }
+ }
+ 
++void MessageLoopDarwin::OnTimerFire(CFRunLoopTimerRef timer, MessageLoopDarwin* loop) {
++  // RunExpiredTasksNow rearms the timer as appropriate via a call to WakeUp.
++  loop->RunExpiredTasksNow();
++}
++
+ }  // namespace fml
+diff --git a/engine/src/flutter/shell/common/animator.cc b/engine/src/flutter/shell/common/animator.cc
+index e8329c1..c567c17 100644
+--- a/engine/src/flutter/shell/common/animator.cc
++++ b/engine/src/flutter/shell/common/animator.cc
+@@ -253,21 +253,19 @@ void Animator::RequestFrame(bool regenerate_layer_trees) {
+     return;
+   }
+ 
+-  // The AwaitVSync is going to call us back at the next VSync. However, we want
+-  // to be reasonably certain that the UI thread is not in the middle of a
+-  // particularly expensive callout. We post the AwaitVSync to run right after
+-  // an idle. This does NOT provide a guarantee that the UI thread has not
+-  // started an expensive operation right after posting this message however.
+-  // To support that, we need edge triggered wakes on VSync.
+-
+-  task_runners_.GetUITaskRunner()->PostTask(
+-      [self = weak_factory_.GetWeakPtr()]() {
+-        if (!self) {
+-          return;
+-        }
+-        self->AwaitVSync();
+-      });
++  // Mark the frame as scheduled before AwaitVSync can run synchronously on the
++  // UI thread. A synchronous test waiter may deliver the frame immediately and
++  // clear this flag before RunNowOrPostTask returns.
+   frame_scheduled_ = true;
++
++  // Avoid an extra UI queue turn that could delay VSync registration past the
++  // next VSync. Requests from other threads are still posted to the UI thread.
++  fml::TaskRunner::RunNowOrPostTask(task_runners_.GetUITaskRunner(),
++                                    [self = weak_factory_.GetWeakPtr()]() {
++                                      if (self) {
++                                        self->AwaitVSync();
++                                      }
++                                    });
+ }
+ 
+ void Animator::AwaitVSync() {
+@@ -294,11 +292,6 @@ void Animator::OnAllViewsRendered() {
+   }
+ }
+ 
+-void Animator::ScheduleSecondaryVsyncCallback(uintptr_t id,
+-                                              const fml::closure& callback) {
+-  waiter_->ScheduleSecondaryCallback(id, callback);
+-}
+-
+ void Animator::ScheduleMaybeClearTraceFlowIds() {
+   waiter_->ScheduleSecondaryCallback(
+       reinterpret_cast<uintptr_t>(this), [self = weak_factory_.GetWeakPtr()] {
+diff --git a/engine/src/flutter/shell/common/animator.h b/engine/src/flutter/shell/common/animator.h
+index e245b1e..258c06b 100644
+--- a/engine/src/flutter/shell/common/animator.h
++++ b/engine/src/flutter/shell/common/animator.h
+@@ -89,24 +89,6 @@ class Animator final {
+ 
+   const std::weak_ptr<VsyncWaiter> GetVsyncWaiter() const;
+ 
+-  //--------------------------------------------------------------------------
+-  /// @brief    Schedule a secondary callback to be executed right after the
+-  ///           main `VsyncWaiter::AsyncWaitForVsync` callback (which is added
+-  ///           by `Animator::RequestFrame`).
+-  ///
+-  ///           Like the callback in `AsyncWaitForVsync`, this callback is
+-  ///           only scheduled to be called once, and it's supposed to be
+-  ///           called in the UI thread. If there is no AsyncWaitForVsync
+-  ///           callback (`Animator::RequestFrame` is not called), this
+-  ///           secondary callback will still be executed at vsync.
+-  ///
+-  ///           This callback is used to provide the vsync signal needed by
+-  ///           `SmoothPointerDataDispatcher`, and for our own flow events.
+-  ///
+-  /// @see      `PointerDataDispatcher::ScheduleSecondaryVsyncCallback`.
+-  void ScheduleSecondaryVsyncCallback(uintptr_t id,
+-                                      const fml::closure& callback);
+-
+   // Enqueue |trace_flow_id| into |trace_flow_ids_|.  The flow event will be
+   // ended at either the next frame, or the next vsync interval with no active
+   // rendering.
+diff --git a/engine/src/flutter/shell/common/animator_unittests.cc b/engine/src/flutter/shell/common/animator_unittests.cc
+index f5f71ae..0dccac3 100644
+--- a/engine/src/flutter/shell/common/animator_unittests.cc
++++ b/engine/src/flutter/shell/common/animator_unittests.cc
+@@ -154,8 +154,8 @@ TEST_F(ShellTest, AnimatorDoesNotNotifyIdleBeforeRender) {
+     ASSERT_FALSE(delegate.notify_idle_called_);
+     // Immediately request a frame saying it can reuse the last layer tree to
+     // avoid more calls to BeginFrame by the animator.
+-    animator->RequestFrame(false);
+     task_runners.GetPlatformTaskRunner()->PostTask(flush_vsync_task);
++    animator->RequestFrame(false);
+   });
+   latch.Wait();
+   ASSERT_FALSE(delegate.notify_idle_called_);
+@@ -173,8 +173,8 @@ TEST_F(ShellTest, AnimatorDoesNotNotifyIdleBeforeRender) {
+         });
+         // Request a frame that builds a layer tree and renders a frame.
+         // When the frame is rendered, render_latch will be signaled.
+-        animator->RequestFrame(true);
+         task_runners.GetPlatformTaskRunner()->PostTask(flush_vsync_task);
++        animator->RequestFrame(true);
+       },
+       // See kNotifyIdleTaskWaitTime in animator.cc.
+       fml::TimeDelta::FromMilliseconds(60));
+@@ -188,8 +188,8 @@ TEST_F(ShellTest, AnimatorDoesNotNotifyIdleBeforeRender) {
+     ASSERT_FALSE(delegate.notify_idle_called_);
+     // False to avoid getting cals to BeginFrame that will request more frames
+     // before we are ready.
+-    animator->RequestFrame(false);
+     task_runners.GetPlatformTaskRunner()->PostTask(flush_vsync_task);
++    animator->RequestFrame(false);
+   });
+   latch.Wait();
+ 
+@@ -252,8 +252,8 @@ TEST_F(ShellTest, AnimatorDoesNotNotifyDelegateIfPipelineIsNotEmpty) {
+         animator->Render(kImplicitViewId, std::move(layer_tree), 1.0);
+         begin_frame_latch.Signal();
+       });
+-      animator->RequestFrame();
+       task_runners.GetPlatformTaskRunner()->PostTask(flush_vsync_task);
++      animator->RequestFrame();
+     });
+     begin_frame_latch.Wait();
+   }
+diff --git a/engine/src/flutter/shell/common/engine.cc b/engine/src/flutter/shell/common/engine.cc
+index f501b8a..7b59bf2 100644
+--- a/engine/src/flutter/shell/common/engine.cc
++++ b/engine/src/flutter/shell/common/engine.cc
+@@ -592,11 +592,6 @@ void Engine::DoDispatchPacket(std::unique_ptr<PointerDataPacket> packet,
+   }
+ }
+ 
+-void Engine::ScheduleSecondaryVsyncCallback(uintptr_t id,
+-                                            const fml::closure& callback) {
+-  animator_->ScheduleSecondaryVsyncCallback(id, callback);
+-}
+-
+ void Engine::HandleAssetPlatformMessage(
+     std::unique_ptr<PlatformMessage> message) {
+   fml::RefPtr<PlatformMessageResponse> response = message->response();
+diff --git a/engine/src/flutter/shell/common/engine.h b/engine/src/flutter/shell/common/engine.h
+index 655ad8c..4a2fe60 100644
+--- a/engine/src/flutter/shell/common/engine.h
++++ b/engine/src/flutter/shell/common/engine.h
+@@ -917,10 +917,6 @@ class Engine final : public RuntimeDelegate, PointerDataDispatcher::Delegate {
+   void DoDispatchPacket(std::unique_ptr<PointerDataPacket> packet,
+                         uint64_t trace_flow_id) override;
+ 
+-  // |PointerDataDispatcher::Delegate|
+-  void ScheduleSecondaryVsyncCallback(uintptr_t id,
+-                                      const fml::closure& callback) override;
+-
+   //----------------------------------------------------------------------------
+   /// @brief      Get the last Entrypoint that was used in the RunConfiguration
+   ///             when |Engine::Run| was called.
+diff --git a/engine/src/flutter/shell/common/engine_animator_unittests.cc b/engine/src/flutter/shell/common/engine_animator_unittests.cc
+index bda96f6..34346eb 100644
+--- a/engine/src/flutter/shell/common/engine_animator_unittests.cc
++++ b/engine/src/flutter/shell/common/engine_animator_unittests.cc
+@@ -300,7 +300,8 @@ TEST_F(EngineAnimatorTest, AnimatorAcceptsMultipleRenders) {
+         engine_context->EngineTaskSync([&](Engine& engine) {
+           engine.BeginFrame(frame_target_time, frame_number);
+         });
+-      });
++      })
++      .WillRepeatedly([](fml::TimePoint, uint64_t) {});
+ 
+   native_latch.Reset();
+   AddNativeCallback("NotifyNative", [](auto args) { native_latch.Signal(); });
+diff --git a/engine/src/flutter/shell/common/input_events_unittests.cc b/engine/src/flutter/shell/common/input_events_unittests.cc
+index a0a22d1..5eb2c5a 100644
+--- a/engine/src/flutter/shell/common/input_events_unittests.cc
++++ b/engine/src/flutter/shell/common/input_events_unittests.cc
+@@ -11,153 +11,12 @@
+ namespace flutter {
+ namespace testing {
+ 
+-// Throughout these tests, the choice of time unit is irrelevant as long as all
+-// times have the same units.
+-using UnitlessTime = int;
+-
+-// Signature of a generator function that takes the frame index as input and
+-// returns the time of that frame.
+-using Generator = std::function<UnitlessTime(int)>;
+-
+ namespace {
+ 
+ constexpr int64_t kImplicitViewId = 0;
+ 
+ }
+ 
+-//----------------------------------------------------------------------------
+-/// Simulate n input events where the i-th one is delivered at delivery_time(i).
+-///
+-/// Simulation results will be written into events_consumed_at_frame whose
+-/// length will be equal to the number of frames drawn. Each element in the
+-/// vector is the number of input events consumed up to that frame. (We can't
+-/// return such vector because ASSERT_TRUE requires return type of void.)
+-///
+-/// We assume (and check) that the delivery latency is some base latency plus a
+-/// random latency where the random latency must be within one frame:
+-///
+-///   1.  latency = delivery_time(i) - j * frame_time = base_latency +
+-///       random_latency
+-///   2.  0 <= base_latency, 0 <= random_latency < frame_time
+-///
+-/// We also assume that there will be at least one input event per frame if
+-/// there were no latency. Let j = floor( (delivery_time(i) - base_latency) /
+-/// frame_time ) be the frame index if there were no latency. Then the set of j
+-/// should be all integers from 0 to continuous_frame_count - 1 for some
+-/// integer continuous_frame_count.
+-///
+-/// (Note that there coulds be multiple input events within one frame.)
+-///
+-/// The test here is insensitive to the choice of time unit as long as
+-/// delivery_time and frame_time are in the same unit.
+-static void TestSimulatedInputEvents(
+-    ShellTest* fixture,
+-    int num_events,
+-    UnitlessTime base_latency,
+-    Generator delivery_time,
+-    UnitlessTime frame_time,
+-    std::vector<UnitlessTime>& events_consumed_at_frame,
+-    bool restart_engine = false) {
+-  ///// Begin constructing shell ///////////////////////////////////////////////
+-  auto settings = fixture->CreateSettingsForFixture();
+-  std::unique_ptr<Shell> shell = fixture->CreateShell({
+-      .settings = settings,
+-      .platform_view_create_callback = ShellTestPlatformViewBuilder({
+-          .simulate_vsync = true,
+-      }),
+-  });
+-
+-  auto configuration = RunConfiguration::InferFromSettings(settings);
+-  configuration.SetEntrypoint("onPointerDataPacketMain");
+-
+-  // The following 4 variables are only accessed in the UI thread by
+-  // nativeOnPointerDataPacket and nativeOnBeginFrame between their
+-  // initializations and `shell.reset()`.
+-  events_consumed_at_frame.clear();
+-  bool will_draw_new_frame = true;
+-  int events_consumed = 0;
+-  int frame_drawn = 0;
+-  auto nativeOnPointerDataPacket = [&events_consumed_at_frame,
+-                                    &will_draw_new_frame, &events_consumed,
+-                                    &frame_drawn](Dart_NativeArguments args) {
+-    events_consumed += 1;
+-    if (will_draw_new_frame) {
+-      frame_drawn += 1;
+-      will_draw_new_frame = false;
+-      events_consumed_at_frame.push_back(events_consumed);
+-    } else {
+-      events_consumed_at_frame.back() = events_consumed;
+-    }
+-  };
+-  fixture->AddNativeCallback("NativeOnPointerDataPacket",
+-                             CREATE_NATIVE_ENTRY(nativeOnPointerDataPacket));
+-
+-  ASSERT_TRUE(configuration.IsValid());
+-  fixture->RunEngine(shell.get(), std::move(configuration));
+-
+-  if (restart_engine) {
+-    auto new_configuration = RunConfiguration::InferFromSettings(settings);
+-    new_configuration.SetEntrypoint("onPointerDataPacketMain");
+-    ASSERT_TRUE(new_configuration.IsValid());
+-    fixture->RestartEngine(shell.get(), std::move(new_configuration));
+-  }
+-  ///// End constructing shell /////////////////////////////////////////////////
+-
+-  ASSERT_GE(base_latency, 0);
+-
+-  // Check that delivery_time satisfies our assumptions.
+-  int continuous_frame_count = 0;
+-  for (int i = 0; i < num_events; i += 1) {
+-    // j is the frame index of event i if there were no latency.
+-    int j = static_cast<int>((delivery_time(i) - base_latency) / frame_time);
+-    if (j == continuous_frame_count) {
+-      continuous_frame_count += 1;
+-    }
+-    double random_latency = delivery_time(i) - j * frame_time - base_latency;
+-    ASSERT_GE(random_latency, 0);
+-    ASSERT_LT(random_latency, frame_time);
+-
+-    // If there were no latency, there should be at least one event per frame.
+-    // Hence j should never skip any integer less than continuous_frame_count.
+-    ASSERT_LT(j, continuous_frame_count);
+-  }
+-
+-  // This has to be running on a different thread than Platform thread to avoid
+-  // dead locks.
+-  auto simulation = std::async(std::launch::async, [&]() {
+-    // i is the input event's index.
+-    // j is the frame's index.
+-    for (int i = 0, j = 0; i < num_events; j += 1) {
+-      double t = j * frame_time;
+-      while (i < num_events && delivery_time(i) <= t) {
+-        // Use a different x every time for the pointer data converter to
+-        // generate non-empty events.
+-        ShellTest::DispatchFakePointerData(shell.get(), /*x=*/i);
+-        i += 1;
+-      }
+-      ShellTest::VSyncFlush(shell.get(), &will_draw_new_frame);
+-    }
+-    // Finally, issue a vsync for the pending event that may be generated duing
+-    // the last vsync.
+-    ShellTest::VSyncFlush(shell.get(), &will_draw_new_frame);
+-  });
+-
+-  simulation.wait();
+-
+-  TaskRunners task_runners = fixture->GetTaskRunnersForFixture();
+-  fml::AutoResetWaitableEvent latch;
+-  task_runners.GetPlatformTaskRunner()->PostTask([&shell, &latch]() mutable {
+-    shell.reset();
+-    latch.Signal();
+-  });
+-  latch.Wait();
+-
+-  // Make sure that all events have been consumed so
+-  // https://github.com/flutter/flutter/issues/40863 won't happen again.
+-  ASSERT_GT(events_consumed_at_frame.size(), 0u);
+-  ASSERT_EQ(events_consumed_at_frame.back(), num_events);
+-}
+-
+ void CreateSimulatedPointerData(PointerData& data,
+                                 PointerData::Change change,
+                                 double dx,
+@@ -193,125 +52,6 @@ void CreateSimulatedPointerData(PointerData& data,
+   data.view_id = kImplicitViewId;
+ }
+ 
+-TEST_F(ShellTest, MissAtMostOneFrameForIrregularInputEvents) {
+-  // We don't use `constexpr int frame_time` here because MSVC doesn't handle
+-  // it well with lambda capture.
+-  UnitlessTime frame_time = 10;
+-  UnitlessTime base_latency = 0.5 * frame_time;
+-  Generator extreme = [frame_time, base_latency](int i) {
+-    return static_cast<UnitlessTime>(
+-        i * frame_time + base_latency +
+-        (i % 2 == 0 ? 0.1 * frame_time : 0.9 * frame_time));
+-  };
+-  constexpr int n = 40;
+-  std::vector<int> events_consumed_at_frame;
+-  TestSimulatedInputEvents(this, n, base_latency, extreme, frame_time,
+-                           events_consumed_at_frame);
+-  int frame_drawn = events_consumed_at_frame.size();
+-  ASSERT_GE(frame_drawn, n - 1);
+-
+-  // Make sure that it also works after an engine restart.
+-  TestSimulatedInputEvents(this, n, base_latency, extreme, frame_time,
+-                           events_consumed_at_frame, true /* restart_engine */);
+-  int frame_drawn_after_restart = events_consumed_at_frame.size();
+-  ASSERT_GE(frame_drawn_after_restart, n - 1);
+-}
+-
+-TEST_F(ShellTest, DelayAtMostOneEventForFasterThanVSyncInputEvents) {
+-  // We don't use `constexpr int frame_time` here because MSVC doesn't handle
+-  // it well with lambda capture.
+-  UnitlessTime frame_time = 10;
+-  UnitlessTime base_latency = 0.2 * frame_time;
+-  Generator double_sampling = [frame_time, base_latency](int i) {
+-    return static_cast<UnitlessTime>(i * 0.5 * frame_time + base_latency);
+-  };
+-  constexpr int n = 40;
+-  std::vector<int> events_consumed_at_frame;
+-  TestSimulatedInputEvents(this, n, base_latency, double_sampling, frame_time,
+-                           events_consumed_at_frame);
+-
+-  // Draw one extra frame due to delaying a pending packet for the next frame.
+-  int frame_drawn = events_consumed_at_frame.size();
+-  ASSERT_EQ(frame_drawn, n / 2 + 1);
+-
+-  for (int i = 0; i < n / 2; i += 1) {
+-    ASSERT_GE(events_consumed_at_frame[i], 2 * i - 1);
+-  }
+-}
+-
+-TEST_F(ShellTest, HandlesActualIphoneXsInputEvents) {
+-  // Actual delivery times measured on iPhone Xs, in the unit of frame_time
+-  // (16.67ms for 60Hz).
+-  static constexpr double iphone_xs_times[] = {0.15,
+-                                               1.0773046874999999,
+-                                               2.1738720703124996,
+-                                               3.0579052734374996,
+-                                               4.0890087890624995,
+-                                               5.0952685546875,
+-                                               6.1251708984375,
+-                                               7.1253076171875,
+-                                               8.125927734374999,
+-                                               9.37248046875,
+-                                               10.133950195312499,
+-                                               11.161201171875,
+-                                               12.226992187499999,
+-                                               13.1443798828125,
+-                                               14.440327148437499,
+-                                               15.091684570312498,
+-                                               16.138681640625,
+-                                               17.126469726562497,
+-                                               18.1592431640625,
+-                                               19.371372070312496,
+-                                               20.033774414062496,
+-                                               21.021782226562497,
+-                                               22.070053710937497,
+-                                               23.325541992187496,
+-                                               24.119648437499997,
+-                                               25.084262695312496,
+-                                               26.077866210937497,
+-                                               27.036547851562496,
+-                                               28.035073242187497,
+-                                               29.081411132812498,
+-                                               30.066064453124998,
+-                                               31.089360351562497,
+-                                               32.086142578125,
+-                                               33.4618798828125,
+-                                               34.14697265624999,
+-                                               35.0513525390625,
+-                                               36.136025390624994,
+-                                               37.1618408203125,
+-                                               38.144472656249995,
+-                                               39.201123046875,
+-                                               40.4339501953125,
+-                                               41.1552099609375,
+-                                               42.102128906249995,
+-                                               43.0426318359375,
+-                                               44.070131835937495,
+-                                               45.08862304687499,
+-                                               46.091469726562494};
+-  constexpr int n = sizeof(iphone_xs_times) / sizeof(iphone_xs_times[0]);
+-  // We don't use `constexpr int frame_time` here because MSVC doesn't handle
+-  // it well with lambda capture.
+-  UnitlessTime frame_time = 10000;
+-  double base_latency_f = 0.0;
+-  for (int i = 0; i < 10; i++) {
+-    base_latency_f += 0.1;
+-    // Everything is converted to int to avoid floating point error in
+-    // TestSimulatedInputEvents.
+-    UnitlessTime base_latency =
+-        static_cast<UnitlessTime>(base_latency_f * frame_time);
+-    Generator iphone_xs_generator = [frame_time, base_latency](int i) {
+-      return base_latency +
+-             static_cast<UnitlessTime>(iphone_xs_times[i] * frame_time);
+-    };
+-    std::vector<int> events_consumed_at_frame;
+-    TestSimulatedInputEvents(this, n, base_latency, iphone_xs_generator,
+-                             frame_time, events_consumed_at_frame);
+-    int frame_drawn = events_consumed_at_frame.size();
+-    ASSERT_GE(frame_drawn, n - 1);
+-  }
+-}
+-
+ TEST_F(ShellTest, CanCorrectlyPipePointerPacket) {
+   // Sets up shell with test fixture.
+   auto settings = CreateSettingsForFixture();
+diff --git a/engine/src/flutter/shell/common/pointer_data_dispatcher.cc b/engine/src/flutter/shell/common/pointer_data_dispatcher.cc
+index 58bf4b1..d6aa0c6 100644
+--- a/engine/src/flutter/shell/common/pointer_data_dispatcher.cc
++++ b/engine/src/flutter/shell/common/pointer_data_dispatcher.cc
+@@ -11,10 +11,6 @@ namespace flutter {
+ PointerDataDispatcher::~PointerDataDispatcher() = default;
+ DefaultPointerDataDispatcher::~DefaultPointerDataDispatcher() = default;
+ 
+-SmoothPointerDataDispatcher::SmoothPointerDataDispatcher(Delegate& delegate)
+-    : DefaultPointerDataDispatcher(delegate), weak_factory_(this) {}
+-SmoothPointerDataDispatcher::~SmoothPointerDataDispatcher() = default;
+-
+ void DefaultPointerDataDispatcher::DispatchPacket(
+     std::unique_ptr<PointerDataPacket> packet,
+     uint64_t trace_flow_id) {
+@@ -25,51 +21,4 @@ void DefaultPointerDataDispatcher::DispatchPacket(
+   delegate_.DoDispatchPacket(std::move(packet), trace_flow_id);
+ }
+ 
+-void SmoothPointerDataDispatcher::DispatchPacket(
+-    std::unique_ptr<PointerDataPacket> packet,
+-    uint64_t trace_flow_id) {
+-  TRACE_EVENT0_WITH_FLOW_IDS("flutter",
+-                             "SmoothPointerDataDispatcher::DispatchPacket",
+-                             /*flow_id_count=*/1, &trace_flow_id);
+-  TRACE_FLOW_STEP("flutter", "PointerEvent", trace_flow_id);
+-
+-  if (is_pointer_data_in_progress_) {
+-    if (pending_packet_ != nullptr) {
+-      DispatchPendingPacket();
+-    }
+-    pending_packet_ = std::move(packet);
+-    pending_trace_flow_id_ = trace_flow_id;
+-  } else {
+-    FML_DCHECK(pending_packet_ == nullptr);
+-    DefaultPointerDataDispatcher::DispatchPacket(std::move(packet),
+-                                                 trace_flow_id);
+-  }
+-  is_pointer_data_in_progress_ = true;
+-  ScheduleSecondaryVsyncCallback();
+-}
+-
+-void SmoothPointerDataDispatcher::ScheduleSecondaryVsyncCallback() {
+-  delegate_.ScheduleSecondaryVsyncCallback(
+-      reinterpret_cast<uintptr_t>(this),
+-      [dispatcher = weak_factory_.GetWeakPtr()]() {
+-        if (dispatcher && dispatcher->is_pointer_data_in_progress_) {
+-          if (dispatcher->pending_packet_ != nullptr) {
+-            dispatcher->DispatchPendingPacket();
+-          } else {
+-            dispatcher->is_pointer_data_in_progress_ = false;
+-          }
+-        }
+-      });
+-}
+-
+-void SmoothPointerDataDispatcher::DispatchPendingPacket() {
+-  FML_DCHECK(pending_packet_ != nullptr);
+-  FML_DCHECK(is_pointer_data_in_progress_);
+-  DefaultPointerDataDispatcher::DispatchPacket(std::move(pending_packet_),
+-                                               pending_trace_flow_id_);
+-  pending_packet_ = nullptr;
+-  pending_trace_flow_id_ = -1;
+-  ScheduleSecondaryVsyncCallback();
+-}
+-
+ }  // namespace flutter
+diff --git a/engine/src/flutter/shell/common/pointer_data_dispatcher.h b/engine/src/flutter/shell/common/pointer_data_dispatcher.h
+index 88c0167..da74a69 100644
+--- a/engine/src/flutter/shell/common/pointer_data_dispatcher.h
++++ b/engine/src/flutter/shell/common/pointer_data_dispatcher.h
+@@ -17,11 +17,6 @@ class PointerDataDispatcher;
+ /// `PlatformView::DispatchPointerDataPacket` on the platform thread, to
+ /// `Window::DispatchPointerDataPacket` on the UI thread.
+ ///
+-/// This class is used to filter the packets so the Flutter framework on the UI
+-/// thread will receive packets with some desired properties. See
+-/// `SmoothPointerDataDispatcher` for an example which filters irregularly
+-/// delivered packets, and dispatches them in sync with the VSYNC signal.
+-///
+ /// This object will be owned by the engine because it relies on the engine's
+ /// `Animator` (which owns `VsyncWaiter`) and `RuntimeController` to do the
+ /// filtering. This object is currently designed to be only called from the UI
+@@ -46,24 +41,6 @@ class PointerDataDispatcher {
+     /// `runtime_controller_`.
+     virtual void DoDispatchPacket(std::unique_ptr<PointerDataPacket> packet,
+                                   uint64_t trace_flow_id) = 0;
+-
+-    //--------------------------------------------------------------------------
+-    /// @brief    Schedule a secondary callback to be executed right after the
+-    ///           main `VsyncWaiter::AsyncWaitForVsync` callback (which is added
+-    ///           by `Animator::RequestFrame`).
+-    ///
+-    ///           Like the callback in `AsyncWaitForVsync`, this callback is
+-    ///           only scheduled to be called once per |id|, and it will be
+-    ///           called in the UI thread. If there is no AsyncWaitForVsync
+-    ///           callback (`Animator::RequestFrame` is not called), this
+-    ///           secondary callback will still be executed at vsync.
+-    ///
+-    ///           This callback is used to provide the vsync signal needed by
+-    ///           `SmoothPointerDataDispatcher`, and for `Animator` input flow
+-    ///           events.
+-    virtual void ScheduleSecondaryVsyncCallback(
+-        uintptr_t id,
+-        const fml::closure& callback) = 0;
+   };
+ 
+   //----------------------------------------------------------------------------
+@@ -99,71 +76,6 @@ class DefaultPointerDataDispatcher : public PointerDataDispatcher {
+   FML_DISALLOW_COPY_AND_ASSIGN(DefaultPointerDataDispatcher);
+ };
+ 
+-//------------------------------------------------------------------------------
+-/// A dispatcher that may temporarily store and defer the last received
+-/// PointerDataPacket if multiple packets are received in one VSYNC. The
+-/// deferred packet will be sent in the next vsync in order to smooth out the
+-/// events. This filters out irregular input events delivery to provide a smooth
+-/// scroll on iPhone X/Xs.
+-///
+-/// It works as follows:
+-///
+-/// When `DispatchPacket` is called while a previous pointer data dispatch is
+-/// still in progress (its frame isn't finished yet), it means that an input
+-/// event is delivered to us too fast. That potentially means a later event will
+-/// be too late which could cause the missing of a frame. Hence we'll cache it
+-/// in `pending_packet_` for the next frame to smooth it out.
+-///
+-/// If the input event is sent to us regularly at the same rate of VSYNC (say
+-/// at 60Hz), this would be identical to `DefaultPointerDataDispatcher` where
+-/// `runtime_controller_->DispatchPointerDataPacket` is always called right
+-/// away. That's because `is_pointer_data_in_progress_` will always be false
+-/// when `DispatchPacket` is called since it will be cleared by the end of a
+-/// frame through `ScheduleSecondaryVsyncCallback`. This is the case for all
+-/// Android/iOS devices before iPhone X/XS.
+-///
+-/// If the input event is irregular, but with a random latency of no more than
+-/// one frame, this would guarantee that we'll miss at most 1 frame. Without
+-/// this, we could miss half of the frames.
+-///
+-/// If the input event is delivered at a higher rate than that of VSYNC, this
+-/// would at most add a latency of one event delivery. For example, if the
+-/// input event is delivered at 120Hz (this is only true for iPad pro, not even
+-/// iPhone X), this may delay the handling of an input event by 8ms.
+-///
+-/// The assumption of this solution is that the sampling itself is still
+-/// regular. Only the event delivery is allowed to be irregular. So far this
+-/// assumption seems to hold on all devices. If it's changed in the future,
+-/// we'll need a different solution.
+-///
+-/// See also input_events_unittests.cc where we test all our claims above.
+-class SmoothPointerDataDispatcher : public DefaultPointerDataDispatcher {
+- public:
+-  explicit SmoothPointerDataDispatcher(Delegate& delegate);
+-
+-  // |PointerDataDispatcer|
+-  void DispatchPacket(std::unique_ptr<PointerDataPacket> packet,
+-                      uint64_t trace_flow_id) override;
+-
+-  virtual ~SmoothPointerDataDispatcher();
+-
+- private:
+-  void DispatchPendingPacket();
+-  void ScheduleSecondaryVsyncCallback();
+-
+-  // If non-null, this will be a pending pointer data packet for the next frame
+-  // to consume. This is used to smooth out the irregular drag events delivery.
+-  // See also `DispatchPointerDataPacket` and input_events_unittests.cc.
+-  std::unique_ptr<PointerDataPacket> pending_packet_;
+-  int pending_trace_flow_id_ = -1;
+-  bool is_pointer_data_in_progress_ = false;
+-
+-  // WeakPtrFactory must be the last member.
+-  fml::TaskRunnerAffineWeakPtrFactory<SmoothPointerDataDispatcher>
+-      weak_factory_;
+-  FML_DISALLOW_COPY_AND_ASSIGN(SmoothPointerDataDispatcher);
+-};
+-
+ //--------------------------------------------------------------------------
+ /// @brief      Signature for constructing PointerDataDispatcher.
+ ///
+diff --git a/engine/src/flutter/shell/common/shell.cc b/engine/src/flutter/shell/common/shell.cc
+index 526d2a7..5040cbe 100644
+--- a/engine/src/flutter/shell/common/shell.cc
++++ b/engine/src/flutter/shell/common/shell.cc
+@@ -1216,14 +1216,15 @@ void Shell::OnPlatformViewDispatchPointerDataPacket(
+   FML_DCHECK(is_set_up_);
+   FML_DCHECK(task_runners_.GetPlatformTaskRunner()->RunsTasksOnCurrentThread());
+ 
+-  task_runners_.GetUITaskRunner()->PostTask(
++  const uint64_t flow_id = next_pointer_flow_id_++;
++  fml::TaskRunner::RunNowOrPostTask(
++      task_runners_.GetUITaskRunner(),
+       fml::MakeCopyable([engine = weak_engine_, packet = std::move(packet),
+-                         flow_id = next_pointer_flow_id_]() mutable {
++                         flow_id]() mutable {
+         if (engine) {
+           engine->DispatchPointerDataPacket(std::move(packet), flow_id);
+         }
+       }));
+-  next_pointer_flow_id_++;
+ }
+ 
+ HitTestResponse Shell::OnPlatformViewHitTest(int64_t view_id,
+diff --git a/engine/src/flutter/shell/common/shell_test_platform_view_gl.cc b/engine/src/flutter/shell/common/shell_test_platform_view_gl.cc
+index 5ee5e7b..59beb4b 100644
+--- a/engine/src/flutter/shell/common/shell_test_platform_view_gl.cc
++++ b/engine/src/flutter/shell/common/shell_test_platform_view_gl.cc
+@@ -90,7 +90,7 @@ ShellTestPlatformViewGL::CreateExternalViewEmbedder() {
+ // |PlatformView|
+ PointerDataDispatcherMaker ShellTestPlatformViewGL::GetDispatcherMaker() {
+   return [](DefaultPointerDataDispatcher::Delegate& delegate) {
+-    return std::make_unique<SmoothPointerDataDispatcher>(delegate);
++    return std::make_unique<DefaultPointerDataDispatcher>(delegate);
+   };
+ }
+ 
+diff --git a/engine/src/flutter/shell/common/shell_test_platform_view_metal.mm b/engine/src/flutter/shell/common/shell_test_platform_view_metal.mm
+index e42d79f..0866f3d 100644
+--- a/engine/src/flutter/shell/common/shell_test_platform_view_metal.mm
++++ b/engine/src/flutter/shell/common/shell_test_platform_view_metal.mm
+@@ -77,7 +77,7 @@ std::shared_ptr<ExternalViewEmbedder> ShellTestPlatformViewMetal::CreateExternal
+ // |PlatformView|
+ PointerDataDispatcherMaker ShellTestPlatformViewMetal::GetDispatcherMaker() {
+   return [](DefaultPointerDataDispatcher::Delegate& delegate) {
+-    return std::make_unique<SmoothPointerDataDispatcher>(delegate);
++    return std::make_unique<DefaultPointerDataDispatcher>(delegate);
+   };
+ }
+ 
+diff --git a/engine/src/flutter/shell/common/shell_test_platform_view_vulkan.cc b/engine/src/flutter/shell/common/shell_test_platform_view_vulkan.cc
+index 6060b0d..f8419b6 100644
+--- a/engine/src/flutter/shell/common/shell_test_platform_view_vulkan.cc
++++ b/engine/src/flutter/shell/common/shell_test_platform_view_vulkan.cc
+@@ -77,7 +77,7 @@ ShellTestPlatformViewVulkan::CreateExternalViewEmbedder() {
+ // |PlatformView|
+ PointerDataDispatcherMaker ShellTestPlatformViewVulkan::GetDispatcherMaker() {
+   return [](DefaultPointerDataDispatcher::Delegate& delegate) {
+-    return std::make_unique<SmoothPointerDataDispatcher>(delegate);
++    return std::make_unique<DefaultPointerDataDispatcher>(delegate);
+   };
+ }
+ 
+diff --git a/engine/src/flutter/shell/common/shell_unittests.cc b/engine/src/flutter/shell/common/shell_unittests.cc
+index 60ff1ec..add459e 100644
+--- a/engine/src/flutter/shell/common/shell_unittests.cc
++++ b/engine/src/flutter/shell/common/shell_unittests.cc
+@@ -2212,60 +2212,6 @@ TEST_F(ShellTest, CanScheduleFrameFromPlatform) {
+   DestroyShell(std::move(shell), task_runners);
+ }
+ 
+-TEST_F(ShellTest, SecondaryVsyncCallbackShouldBeCalledAfterVsyncCallback) {
+-  bool is_on_begin_frame_called = false;
+-  bool is_secondary_callback_called = false;
+-  bool test_started = false;
+-  Settings settings = CreateSettingsForFixture();
+-  TaskRunners task_runners = GetTaskRunnersForFixture();
+-  fml::AutoResetWaitableEvent latch;
+-  AddNativeCallback(
+-      "NotifyNative",
+-      CREATE_NATIVE_ENTRY([&](Dart_NativeArguments args) { latch.Signal(); }));
+-  fml::CountDownLatch count_down_latch(2);
+-  AddNativeCallback("NativeOnBeginFrame",
+-                    CREATE_NATIVE_ENTRY([&](Dart_NativeArguments args) {
+-                      if (!test_started) {
+-                        return;
+-                      }
+-                      EXPECT_FALSE(is_on_begin_frame_called);
+-                      EXPECT_FALSE(is_secondary_callback_called);
+-                      is_on_begin_frame_called = true;
+-                      count_down_latch.CountDown();
+-                    }));
+-  std::unique_ptr<Shell> shell = CreateShell({
+-      .settings = settings,
+-      .task_runners = task_runners,
+-  });
+-  ASSERT_TRUE(shell->IsSetup());
+-
+-  auto configuration = RunConfiguration::InferFromSettings(settings);
+-  configuration.SetEntrypoint("onBeginFrameWithNotifyNativeMain");
+-  RunEngine(shell.get(), std::move(configuration));
+-
+-  // Wait for the application to attach the listener.
+-  latch.Wait();
+-
+-  fml::TaskRunner::RunNowOrPostTask(
+-      shell->GetTaskRunners().GetUITaskRunner(), [&]() {
+-        shell->GetEngine()->ScheduleSecondaryVsyncCallback(0, [&]() {
+-          if (!test_started) {
+-            return;
+-          }
+-          EXPECT_TRUE(is_on_begin_frame_called);
+-          EXPECT_FALSE(is_secondary_callback_called);
+-          is_secondary_callback_called = true;
+-          count_down_latch.CountDown();
+-        });
+-        shell->GetEngine()->ScheduleFrame();
+-        test_started = true;
+-      });
+-  count_down_latch.Wait();
+-  EXPECT_TRUE(is_on_begin_frame_called);
+-  EXPECT_TRUE(is_secondary_callback_called);
+-  DestroyShell(std::move(shell), task_runners);
+-}
+-
+ static void LogSkData(const sk_sp<SkData>& data, const char* title) {
+   FML_LOG(ERROR) << "---------- " << title;
+   std::ostringstream ostr;
+diff --git a/engine/src/flutter/shell/gpu/gpu_surface_metal_impeller.mm b/engine/src/flutter/shell/gpu/gpu_surface_metal_impeller.mm
+index f259669..a4187d3 100644
+--- a/engine/src/flutter/shell/gpu/gpu_surface_metal_impeller.mm
++++ b/engine/src/flutter/shell/gpu/gpu_surface_metal_impeller.mm
+@@ -172,7 +172,7 @@ std::unique_ptr<SurfaceFrame> GPUSurfaceMetalImpeller::AcquireFrameFromCAMetalLa
+         if (!surface) {
+           return false;
+         }
+-        surface->PresentWithTransaction(surface_frame.submit_info().present_with_transaction);
++        surface->PresentWithTransaction(strong_layer.presentsWithTransaction);
+ 
+         if (clip_rect && clip_rect->IsEmpty()) {
+           if (!surface->PreparePresent()) {
+diff --git a/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayer.h b/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayer.h
+index 9454bda..5468d74 100644
+--- a/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayer.h
++++ b/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayer.h
+@@ -7,25 +7,12 @@
+ 
+ #import <QuartzCore/QuartzCore.h>
+ 
+-/// Drop-in replacement (as far as Flutter is concerned) for CAMetalLayer
+-/// that can present with transaction from a background thread.
+-///
+-/// Properties and method declarations must exactly match those in the
+-/// CAMetalLayer interface declaration.
+-@interface FlutterMetalLayer : CALayer
+-
+-@property(nullable, retain) id<MTLDevice> device;
+-@property(nullable, readonly) id<MTLDevice> preferredDevice API_AVAILABLE(macos(10.15),
+-                                                                          ios(13.0),
+-                                                                          tvos(13.0))
+-    API_UNAVAILABLE(watchos);
+-@property MTLPixelFormat pixelFormat;
+-@property BOOL framebufferOnly;
+-@property CGSize drawableSize;
+-@property BOOL presentsWithTransaction;
+-@property(nullable) CGColorSpaceRef colorspace;
+-
+-- (nullable id<CAMetalDrawable>)nextDrawable;
++/// A CAMetalLayer that provides Flutter with IOSurface-backed render targets
++/// and presents their completed contents through the native drawable pipeline.
++@interface FlutterMetalLayer : CAMetalLayer
++
++/// Returns an IOSurface-backed drawable for Flutter rendering.
++- (nullable id<CAMetalDrawable>)nextFlutterDrawable;
+ 
+ /// Returns whether the Metal layer is enabled.
+ /// This is controlled by FLTUseFlutterMetalLayer value in Info.plist.
+diff --git a/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayer.mm b/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayer.mm
+index 5d02de6..04283e4 100644
+--- a/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayer.mm
++++ b/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayer.mm
+@@ -18,10 +18,7 @@ FLUTTER_ASSERT_ARC
+ @class FlutterTexture;
+ @class FlutterDrawable;
+ 
+-extern CFTimeInterval display_link_target;
+-
+ @interface FlutterMetalLayer () {
+-  id<MTLDevice> _preferredDevice;
+   CGSize _drawableSize;
+ 
+   NSUInteger _nextDrawableId;
+@@ -30,26 +27,11 @@ extern CFTimeInterval display_link_target;
+   NSMutableSet<FlutterTexture*>* _availableTextures;
+   NSUInteger _totalTextures;
+   FlutterTexture* _front;
+-
+-  // There must be a CADisplayLink scheduled *on main thread* otherwise
+-  // core animation only updates layers 60 times a second.
+-  CADisplayLink* _displayLink;
+-  NSUInteger _displayLinkPauseCountdown;
+-
+-  // Used to track whether the content was set during this display link.
+-  // When unlocking phone the layer (main thread) display link and raster thread
+-  // display link get out of sync for several seconds. Even worse, layer display
+-  // link does not seem to reflect actual vsync. Forcing the layer link
+-  // to max rate (instead range) temporarily seems to fix the issue.
+-  BOOL _didSetContentsDuringThisDisplayLinkPeriod;
+-
+-  // Whether layer displayLink is forced to max rate.
+-  BOOL _displayLinkForcedMaxRate;
+ }
+ 
+-- (void)onDisplayLink:(CADisplayLink*)link;
+ - (void)presentTexture:(FlutterTexture*)texture;
+ - (void)returnTexture:(FlutterTexture*)texture;
++- (id<CAMetalDrawable>)acquirePresentationDrawable;
+ 
+ @end
+ 
+@@ -77,6 +59,7 @@ extern CFTimeInterval display_link_target;
+ @interface FlutterDrawable : NSObject <FlutterMetalDrawable> {
+   FlutterTexture* _texture;
+   __weak FlutterMetalLayer* _layer;
++  id<CAMetalDrawable> _presentationDrawable;
+   NSUInteger _drawableId;
+   BOOL _presented;
+ }
+@@ -120,6 +103,8 @@ extern CFTimeInterval display_link_target;
+ }
+ 
+ - (void)present {
++  [_presentationDrawable present];
++  _presentationDrawable = nil;
+   [_layer presentTexture:self->_texture];
+   self->_presented = YES;
+ }
+@@ -146,6 +131,38 @@ extern CFTimeInterval display_link_target;
+ - (void)flutterPrepareForPresent:(nonnull id<MTLCommandBuffer>)commandBuffer {
+   FlutterTexture* texture = _texture;
+   texture.waitingForCompletion = YES;
++
++  id<CAMetalDrawable> presentationDrawable = [_layer acquirePresentationDrawable];
++  id<MTLTexture> presentationTexture = presentationDrawable.texture;
++
++  // A resize can leave an old Flutter texture in flight. Do not copy
++  // it into a drawable created for the new layer configuration.
++  const BOOL canCopy = presentationTexture != nil &&
++                       presentationTexture.width == texture.texture.width &&
++                       presentationTexture.height == texture.texture.height &&
++                       presentationTexture.pixelFormat == texture.texture.pixelFormat;
++
++  if (canCopy) {
++    // Copy the IOSurface-backed Flutter result into the drawable owned by this CAMetalLayer.
++    // Encoding the copy and presentation on the render command buffer preserves GPU ordering
++    // without making the CPU wait.
++    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
++    MTLOrigin origin = MTLOriginMake(0, 0, 0);
++    MTLSize size = MTLSizeMake(texture.texture.width, texture.texture.height, 1);
++    [blit copyFromTexture:texture.texture
++              sourceSlice:0
++              sourceLevel:0
++             sourceOrigin:origin
++               sourceSize:size
++                toTexture:presentationTexture
++         destinationSlice:0
++         destinationLevel:0
++        destinationOrigin:origin];
++    [blit endEncoding];
++    // Defer presentation until the command buffer is scheduled so the native
++    // drawable can join the Core Animation transaction used by platform views.
++    _presentationDrawable = presentationDrawable;
++  }
+   [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+     texture.waitingForCompletion = NO;
+   }];
+@@ -153,40 +170,16 @@ extern CFTimeInterval display_link_target;
+ 
+ @end
+ 
+-@interface FlutterMetalLayerDisplayLinkProxy : NSObject {
+-  __weak FlutterMetalLayer* _layer;
+-}
+-
+-@end
+-
+-@implementation FlutterMetalLayerDisplayLinkProxy
+-- (instancetype)initWithLayer:(FlutterMetalLayer*)layer {
+-  if (self = [super init]) {
+-    _layer = layer;
+-  }
+-  return self;
+-}
+-
+-- (void)onDisplayLink:(CADisplayLink*)link {
+-  [_layer onDisplayLink:link];
+-}
+-
+-@end
+-
+ @implementation FlutterMetalLayer
+ 
+ - (instancetype)init {
+   if (self = [super init]) {
+-    _preferredDevice = MTLCreateSystemDefaultDevice();
+-    self.device = self.preferredDevice;
++    self.opaque = NO;
++    self.presentsWithTransaction = YES;
++    self.device = MTLCreateSystemDefaultDevice();
+     self.pixelFormat = MTLPixelFormatBGRA8Unorm;
+     _availableTextures = [[NSMutableSet alloc] init];
+ 
+-    FlutterMetalLayerDisplayLinkProxy* proxy =
+-        [[FlutterMetalLayerDisplayLinkProxy alloc] initWithLayer:self];
+-    _displayLink = [CADisplayLink displayLinkWithTarget:proxy selector:@selector(onDisplayLink:)];
+-    [self setMaxRefreshRate:FlutterDisplayLinkManager.displayRefreshRate forceMax:NO];
+-    [_displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
+     [[NSNotificationCenter defaultCenter] addObserver:self
+                                              selector:@selector(didEnterBackground:)
+                                                  name:UIApplicationDidEnterBackgroundNotification
+@@ -196,47 +189,18 @@ extern CFTimeInterval display_link_target;
+ }
+ 
+ - (void)dealloc {
+-  [_displayLink invalidate];
+   [[NSNotificationCenter defaultCenter] removeObserver:self];
+ }
+ 
+-- (void)setMaxRefreshRate:(double)refreshRate forceMax:(BOOL)forceMax {
+-  // This is copied from vsync_waiter_ios.mm. The vsync waiter has display link scheduled on UI
+-  // thread which does not trigger actual core animation frame. As a workaround FlutterMetalLayer
+-  // has it's own displaylink scheduled on main thread, which is used to trigger core animation
+-  // frame allowing for 120hz updates.
+-  if (!FlutterDisplayLinkManager.maxRefreshRateEnabledOnIPhone) {
+-    return;
+-  }
+-  double maxFrameRate = fmax(refreshRate, 60);
+-  double minFrameRate = fmax(maxFrameRate / 2, 60);
+-  _displayLink.preferredFrameRateRange =
+-      CAFrameRateRangeMake(forceMax ? maxFrameRate : minFrameRate, maxFrameRate, maxFrameRate);
+-}
+-
+-- (void)onDisplayLink:(CADisplayLink*)link {
+-  _didSetContentsDuringThisDisplayLinkPeriod = NO;
+-  // Do not pause immediately, this seems to prevent 120hz while touching.
+-  if (_displayLinkPauseCountdown == 3) {
+-    _displayLink.paused = YES;
+-    if (_displayLinkForcedMaxRate) {
+-      [self setMaxRefreshRate:FlutterDisplayLinkManager.displayRefreshRate forceMax:NO];
+-      _displayLinkForcedMaxRate = NO;
+-    }
+-  } else {
+-    ++_displayLinkPauseCountdown;
+-  }
++- (void)setOpaque:(BOOL)opaque {
++  // Direct presentation can stall while platform views are composited. Keep
++  // this layer in the Core Animation compositing path for stable presentation.
++  [super setOpaque:NO];
+ }
+ 
+-- (BOOL)isKindOfClass:(Class)aClass {
+-#pragma clang diagnostic push
+-#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+-  // Pretend that we're a CAMetalLayer so that the rest of Flutter plays along
+-  if ([aClass isEqual:[CAMetalLayer class]]) {
+-    return YES;
+-  }
+-#pragma clang diagnostic pop
+-  return [super isKindOfClass:aClass];
++- (void)setPresentsWithTransaction:(BOOL)presentsWithTransaction {
++  // Keep the presentation mode stable when platform views are added or removed.
++  [super setPresentsWithTransaction:YES];
+ }
+ 
+ - (void)setDrawableSize:(CGSize)drawableSize {
+@@ -245,6 +209,7 @@ extern CFTimeInterval display_link_target;
+     _front = nil;
+     _totalTextures = 0;
+     _drawableSize = drawableSize;
++    [super setDrawableSize:drawableSize];
+   }
+ }
+ 
+@@ -253,7 +218,6 @@ extern CFTimeInterval display_link_target;
+     [_availableTextures removeAllObjects];
+     _totalTextures = _front != nil ? 1 : 0;
+   }
+-  _displayLink.paused = YES;
+ }
+ 
+ - (CGSize)drawableSize {
+@@ -337,12 +301,12 @@ extern CFTimeInterval display_link_target;
+         return nil;
+       }
+       MTLTextureDescriptor* textureDescriptor =
+-          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:_pixelFormat
++          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:self.pixelFormat
+                                                              width:_drawableSize.width
+                                                             height:_drawableSize.height
+                                                          mipmapped:NO];
+ 
+-      if (_framebufferOnly) {
++      if (self.framebufferOnly) {
+         textureDescriptor.usage = MTLTextureUsageRenderTarget;
+       } else {
+         textureDescriptor.usage =
+@@ -384,7 +348,7 @@ extern CFTimeInterval display_link_target;
+   }
+ }
+ 
+-- (id<CAMetalDrawable>)nextDrawable {
++- (id<CAMetalDrawable>)nextFlutterDrawable {
+   FlutterTexture* texture = [self nextTexture];
+   if (texture == nil) {
+     return nil;
+@@ -395,31 +359,13 @@ extern CFTimeInterval display_link_target;
+   return drawable;
+ }
+ 
+-- (void)presentOnMainThread:(FlutterTexture*)texture {
+-  if (texture.texture.width != _drawableSize.width ||
+-      texture.texture.height != _drawableSize.height) {
+-    // This texture was created with an old size, but the view has since been
+-    // resized. Do not present this stale frame to avoid distortion. The texture
+-    // will be correctly recycled on the next frame.
+-    return;
+-  }
++- (id<CAMetalDrawable>)nextDrawable {
++  // Metal renderers receive this instance as CAMetalLayer and call nextDrawable.
++  return [self nextFlutterDrawable];
++}
+ 
+-  // This is needed otherwise frame gets skipped on touch begin / end. Go figure.
+-  // Might also be placebo
+-  [self setNeedsDisplay];
+-
+-  [CATransaction begin];
+-  [CATransaction setDisableActions:YES];
+-  self.contents = texture.surface;
+-  [CATransaction commit];
+-  _displayLink.paused = NO;
+-  _displayLinkPauseCountdown = 0;
+-  if (!_didSetContentsDuringThisDisplayLinkPeriod) {
+-    _didSetContentsDuringThisDisplayLinkPeriod = YES;
+-  } else if (!_displayLinkForcedMaxRate) {
+-    _displayLinkForcedMaxRate = YES;
+-    [self setMaxRefreshRate:FlutterDisplayLinkManager.displayRefreshRate forceMax:YES];
+-  }
++- (id<CAMetalDrawable>)acquirePresentationDrawable {
++  return [super nextDrawable];
+ }
+ 
+ - (void)presentTexture:(FlutterTexture*)texture {
+@@ -433,14 +379,6 @@ extern CFTimeInterval display_link_target;
+     }
+     _front = texture;
+     texture.presentedTime = CACurrentMediaTime();
+-    if ([NSThread isMainThread]) {
+-      [self presentOnMainThread:texture];
+-    } else {
+-      // Core animation layers can only be updated on main thread.
+-      dispatch_async(dispatch_get_main_queue(), ^{
+-        [self presentOnMainThread:texture];
+-      });
+-    }
+   }
+ }
+ 
+diff --git a/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayerTest.mm b/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayerTest.mm
+index ecdaaa8..8a5f6a5 100644
+--- a/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayerTest.mm
++++ b/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterMetalLayerTest.mm
+@@ -28,25 +28,17 @@
+ /// A fake compositor that simulates presenting layer surface by increasing
+ /// and decreasing IOSurface use count.
+ @interface TestCompositor : NSObject {
+-  FlutterMetalLayer* _layer;
+   IOSurfaceRef _presentedSurface;
+ }
++- (void)commitTexture:(id<MTLTexture>)texture;
+ @end
+ 
+ @implementation TestCompositor
+ 
+-- (instancetype)initWithLayer:(FlutterMetalLayer*)layer {
+-  self = [super init];
+-  if (self) {
+-    self->_layer = layer;
+-  }
+-  return self;
+-}
+-
+ /// Increment use count of currently presented surface and decrement use count
+ /// of previously presented surface.
+-- (void)commitTransaction {
+-  IOSurfaceRef surface = (__bridge IOSurfaceRef)self->_layer.contents;
++- (void)commitTexture:(id<MTLTexture>)texture {
++  IOSurfaceRef surface = texture.iosurface;
+   if (self->_presentedSurface) {
+     IOSurfaceDecrementUseCount(self->_presentedSurface);
+   }
+@@ -75,6 +67,26 @@
+ - (void)removeMetalLayer:(FlutterMetalLayer*)layer {
+ }
+ 
++- (void)testAlwaysPresentsWithTransaction {
++  FlutterMetalLayer* layer = [self addMetalLayer];
++  XCTAssertTrue(layer.presentsWithTransaction);
++
++  layer.presentsWithTransaction = NO;
++  XCTAssertTrue(layer.presentsWithTransaction);
++
++  [self removeMetalLayer:layer];
++}
++
++- (void)testAlwaysComposited {
++  FlutterMetalLayer* layer = [self addMetalLayer];
++  XCTAssertFalse(layer.opaque);
++
++  layer.opaque = YES;
++  XCTAssertFalse(layer.opaque);
++
++  [self removeMetalLayer:layer];
++}
++
+ // For unknown reason sometimes CI fails to create IOSurface. Bail out
+ // to prevent flakiness.
+ #define BAIL_IF_NO_DRAWABLE(drawable)                        \
+@@ -85,7 +97,7 @@
+ 
+ - (void)testFlip {
+   FlutterMetalLayer* layer = [self addMetalLayer];
+-  TestCompositor* compositor = [[TestCompositor alloc] initWithLayer:layer];
++  TestCompositor* compositor = [[TestCompositor alloc] init];
+ 
+   id<MTLTexture> t1, t2, t3;
+ 
+@@ -93,19 +105,19 @@
+   BAIL_IF_NO_DRAWABLE(drawable);
+   t1 = drawable.texture;
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+ 
+   drawable = [layer nextDrawable];
+   BAIL_IF_NO_DRAWABLE(drawable);
+   t2 = drawable.texture;
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+ 
+   drawable = [layer nextDrawable];
+   BAIL_IF_NO_DRAWABLE(drawable);
+   t3 = drawable.texture;
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+ 
+   // If there was no frame drop, layer should return oldest presented
+   // texture.
+@@ -114,17 +126,17 @@
+   XCTAssertEqual(drawable.texture, t1);
+ 
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+ 
+   drawable = [layer nextDrawable];
+   XCTAssertEqual(drawable.texture, t2);
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+ 
+   drawable = [layer nextDrawable];
+   XCTAssertEqual(drawable.texture, t3);
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+ 
+   drawable = [layer nextDrawable];
+   XCTAssertEqual(drawable.texture, t1);
+@@ -135,7 +147,7 @@
+ 
+ - (void)testFlipWithDroppedFrame {
+   FlutterMetalLayer* layer = [self addMetalLayer];
+-  TestCompositor* compositor = [[TestCompositor alloc] initWithLayer:layer];
++  TestCompositor* compositor = [[TestCompositor alloc] init];
+ 
+   id<MTLTexture> t1, t2, t3;
+ 
+@@ -143,20 +155,20 @@
+   BAIL_IF_NO_DRAWABLE(drawable);
+   t1 = drawable.texture;
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+   XCTAssertTrue(IOSurfaceIsInUse(t1.iosurface));
+ 
+   drawable = [layer nextDrawable];
+   BAIL_IF_NO_DRAWABLE(drawable);
+   t2 = drawable.texture;
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+ 
+   drawable = [layer nextDrawable];
+   BAIL_IF_NO_DRAWABLE(drawable);
+   t3 = drawable.texture;
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+ 
+   // Simulate compositor holding on to t3 for a while.
+   IOSurfaceIncrementUseCount(t3.iosurface);
+@@ -172,7 +184,7 @@
+   drawable = [layer nextDrawable];
+   XCTAssertEqual(drawable.texture, t2);
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+ 
+   // Next drawable should be t1, since it was never picked up by compositor.
+   drawable = [layer nextDrawable];
+@@ -240,7 +252,7 @@
+ 
+ - (void)testTimeout {
+   FlutterMetalLayer* layer = [self addMetalLayer];
+-  TestCompositor* compositor = [[TestCompositor alloc] initWithLayer:layer];
++  TestCompositor* compositor = [[TestCompositor alloc] init];
+ 
+   id<CAMetalDrawable> drawable = [layer nextDrawable];
+   BAIL_IF_NO_DRAWABLE(drawable);
+@@ -257,7 +269,7 @@
+ 
+   [(id<FlutterMetalDrawable>)drawable flutterPrepareForPresent:mockCommandBuffer];
+   [drawable present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:drawable.texture];
+ 
+   // Drawable will not be available until the command buffer completes.
+   drawable = [layer nextDrawable];
+@@ -276,12 +288,12 @@
+   @autoreleasepool {
+     FlutterMetalLayer* layer = [self addMetalLayer];
+     weakLayer = layer;
+-    TestCompositor* compositor = [[TestCompositor alloc] initWithLayer:layer];
++    TestCompositor* compositor = [[TestCompositor alloc] init];
+ 
+     id<CAMetalDrawable> drawable = [layer nextDrawable];
+     BAIL_IF_NO_DRAWABLE(drawable);
+     [drawable present];
+-    [compositor commitTransaction];
++    [compositor commitTexture:drawable.texture];
+ 
+     [self removeMetalLayer:layer];
+   }
+@@ -296,7 +308,7 @@
+ 
+ - (void)testResizeAndPresent {
+   FlutterMetalLayer* layer = [self addMetalLayer];
+-  TestCompositor* compositor = [[TestCompositor alloc] initWithLayer:layer];
++  TestCompositor* compositor = [[TestCompositor alloc] init];
+ 
+   id<CAMetalDrawable> oldSizeDrawable1 = [layer nextDrawable];
+   BAIL_IF_NO_DRAWABLE(oldSizeDrawable1);
+@@ -308,15 +320,15 @@
+ 
+   // After resizing, present the drawables that were allocated using the old size.
+   [oldSizeDrawable1 present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:oldSizeDrawable1.texture];
+   [oldSizeDrawable2 present];
+-  [compositor commitTransaction];
++  [compositor commitTexture:oldSizeDrawable2.texture];
+ 
+   // Verify that textures with the old size have been removed from the layer.
+   for (int i = 0; i < 4; i++) {
+     id<CAMetalDrawable> drawable = [layer nextDrawable];
+     [drawable present];
+-    [compositor commitTransaction];
++    [compositor commitTexture:drawable.texture];
+     XCTAssertEqual(drawable.texture.width, newSize);
+   }
+ 
+diff --git a/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterPlatformViewsController.mm b/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterPlatformViewsController.mm
+index 9d41473..25ddf83 100644
+--- a/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterPlatformViewsController.mm
++++ b/engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterPlatformViewsController.mm
+@@ -318,6 +318,7 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
+   std::vector<int64_t> _visitedPlatformViews;
+   std::unordered_set<int64_t> _viewsToRecomposite;
+   std::vector<int64_t> _previousCompositionOrder;
++  NSUInteger _jointPendingFrames;
+ }
+ 
+ - (id)init {
+@@ -838,6 +839,14 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
+   }
+   self.hadPlatformViews = !self.compositionOrder.empty();
+ 
++  [self.taskRunner runNowOrPostTask:^{
++    FML_CHECK(NSThread.isMainThread);
++    if (self->_jointPendingFrames++ == 0) {
++      [CATransaction begin];
++      [CATransaction setDisableActions:YES];
++    }
++  }];
++
+   bool didEncode = true;
+   LayersMap platformViewLayers;
+   std::vector<std::unique_ptr<flutter::SurfaceFrame>> surfaceFrames;
+@@ -934,12 +943,20 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
+                                  compositionOrder = self.compositionOrder,                  //
+                                  unusedLayers = std::move(unusedLayers),                    //
+                                  surfaceFrames = std::move(surfaceFrames)]() mutable {
+-    [self performSubmit:platformViewLayers
+-        currentCompositionParams:currentCompositionParams
+-              viewsToRecomposite:viewsToRecomposite
+-                compositionOrder:compositionOrder
+-                    unusedLayers:unusedLayers
+-                   surfaceFrames:surfaceFrames];
++    @try {
++      [self performSubmit:platformViewLayers
++          currentCompositionParams:currentCompositionParams
++                viewsToRecomposite:viewsToRecomposite
++                  compositionOrder:compositionOrder
++                      unusedLayers:unusedLayers
++                     surfaceFrames:surfaceFrames];
++    } @finally {
++      FML_CHECK(NSThread.isMainThread);
++      FML_CHECK(self->_jointPendingFrames > 0);
++      if (--self->_jointPendingFrames == 0) {
++        [CATransaction commit];
++      }
++    }
+   });
+ 
+   [self.taskRunner runNowOrPostTask:^{
+@@ -995,8 +1012,6 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
+   TRACE_EVENT0("flutter", "PlatformViewsController::PerformSubmit");
+   FML_DCHECK([[NSThread currentThread] isMainThread]);
+ 
+-  [CATransaction begin];
+-
+   // Configure Flutter overlay views.
+   for (const auto& [viewId, layerData] : platformViewLayers) {
+     layerData.layer->UpdateViewState(self.flutterView,     //
+@@ -1027,8 +1042,6 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
+ 
+   // Organize the layers by their z indexes.
+   [self bringLayersIntoView:platformViewLayers withCompositionOrder:compositionOrder];
+-
+-  [CATransaction commit];
+ }
+ 
+ - (void)bringLayersIntoView:(const LayersMap&)layerMap
+diff --git a/engine/src/flutter/shell/platform/darwin/ios/framework/Source/VSyncClient.swift b/engine/src/flutter/shell/platform/darwin/ios/framework/Source/VSyncClient.swift
+index 281be1c..84d78cf 100644
+--- a/engine/src/flutter/shell/platform/darwin/ios/framework/Source/VSyncClient.swift
++++ b/engine/src/flutter/shell/platform/darwin/ios/framework/Source/VSyncClient.swift
+@@ -13,6 +13,7 @@ public class VSyncClient: NSObject {
+   private let taskRunner: TaskRunner
+   private let isVariableRefreshRateEnabled: Bool
+   private let callback: (CFTimeInterval, CFTimeInterval) -> Void
++  private var updateLinkClient: AnyObject?
+ 
+   /// The display link used to coordinate vsync callbacks.
+   @objc
+@@ -110,9 +111,40 @@ public class VSyncClient: NSObject {
+   /// `onDisplayLink(_:)` on the next vsync event.
+   @objc
+   public func await() {
++    if #available(iOS 18.0, *), allowPauseAfterVsync, awaitUIUpdate() {
++      return
++    }
+     displayLink?.isPaused = false
+   }
+ 
++  /// Uses the active scene's UI update cycle when available. Returns `false` when no active scene
++  /// exists so the caller can fall back to `CADisplayLink`.
++  @available(iOS 18.0, *)
++  private func awaitUIUpdate() -> Bool {
++    // UIWindowScene and UIUpdateLink are UIKit objects and must only be
++    // accessed from the main thread. Tests and embedders may use a distinct UI
++    // task runner, in which case CADisplayLink remains the compatible path.
++    guard Thread.isMainThread else {
++      return false
++    }
++
++    if updateLinkClient == nil {
++      guard let scene = UIApplication.shared.connectedScenes.first(where: {
++        $0.activationState == .foregroundActive
++      }) as? UIWindowScene else {
++        return false
++      }
++
++      updateLinkClient = UIUpdateLinkClient(scene: scene) {
++        [weak self] timestamp, targetTimestamp in
++        self?.onVsync(timestamp: timestamp, targetTimestamp: targetTimestamp)
++      }
++    }
++
++    (updateLinkClient as? UIUpdateLinkClient)?.await()
++    return true
++  }
++
+   /// Pauses the display link to stop receiving vsync callbacks.
+   ///
+   /// Calling this method pauses the underlying `CADisplayLink`, preventing it from triggering
+@@ -175,6 +207,15 @@ public class VSyncClient: NSObject {
+       targetTimestamp = timestamp + (1.0 / refreshRate)
+     }
+ 
++    if allowPauseAfterVsync {
++      link.isPaused = true
++    }
++
++    onVsync(timestamp: timestamp, targetTimestamp: targetTimestamp)
++  }
++
++  /// Records timing information and delivers a vsync callback to the engine.
++  private func onVsync(timestamp: CFTimeInterval, targetTimestamp: CFTimeInterval) {
+     Tracing.tracePlatformVsync(
+       withStartTime: timestamp,
+       targetTime: targetTimestamp
+@@ -195,13 +236,52 @@ public class VSyncClient: NSObject {
+       }
+     }
+ 
+-    if allowPauseAfterVsync {
+-      link.isPaused = true
+-    }
+     callback(timestamp, targetTimestamp)
+   }
+ }
+ 
++/// Delivers Flutter's vsync callback from the active iOS UI update cycle. This avoids waiting an
++/// extra display interval when resuming a paused `CADisplayLink`, while preserving Flutter's
++/// demand-driven behavior by requesting only one UI update for each awaited frame.
++@available(iOS 18.0, *)
++private final class UIUpdateLinkClient: NSObject {
++  /// The engine callback that receives the current UI update's frame timing.
++  private let callback: (CFTimeInterval, CFTimeInterval) -> Void
++
++  /// Whether Flutter is waiting for the next UI update to begin a frame.
++  private var isAwaiting = false
++
++  private lazy var updateLink: UIUpdateLink = {
++    let link = UIUpdateLink(windowScene: scene)
++    link.addAction(to: .beforeCADisplayLinkDispatch) { [weak self] _, info in
++      self?.onUIUpdate(info)
++    }
++    link.isEnabled = true
++    return link
++  }()
++  private let scene: UIWindowScene
++
++  init(scene: UIWindowScene, callback: @escaping (CFTimeInterval, CFTimeInterval) -> Void) {
++    self.scene = scene
++    self.callback = callback
++    super.init()
++  }
++
++  /// Requests one UI update for the frame Flutter is currently awaiting.
++  public func await() {
++    isAwaiting = true
++    updateLink.requiresContinuousUpdates = true
++  }
++
++  /// Completes the pending request with the timing supplied by the current iOS UI update.
++  private func onUIUpdate(_ info: UIUpdateInfo) {
++    guard isAwaiting else { return }
++    isAwaiting = false
++    updateLink.requiresContinuousUpdates = false
++    callback(info.modelTime, info.estimatedPresentationTime)
++  }
++}
++
+ /// A weak proxy target for `CADisplayLink` callbacks to prevent retain cycles.
+ ///
+ /// `CADisplayLink` strongly retains its target. If the display link directly targeted
+diff --git a/engine/src/flutter/shell/platform/darwin/ios/platform_view_ios.mm b/engine/src/flutter/shell/platform/darwin/ios/platform_view_ios.mm
+index afefa08..966bd77 100644
+--- a/engine/src/flutter/shell/platform/darwin/ios/platform_view_ios.mm
++++ b/engine/src/flutter/shell/platform/darwin/ios/platform_view_ios.mm
+@@ -106,7 +106,7 @@ void PlatformViewIOS::attachView() {
+ 
+ PointerDataDispatcherMaker PlatformViewIOS::GetDispatcherMaker() {
+   return [](DefaultPointerDataDispatcher::Delegate& delegate) {
+-    return std::make_unique<SmoothPointerDataDispatcher>(delegate);
++    return std::make_unique<DefaultPointerDataDispatcher>(delegate);
+   };
+ }
+ 

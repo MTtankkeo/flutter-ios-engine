@@ -1,0 +1,16 @@
+name: Check stable patch
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check scripts
+        run: python3 -m py_compile scripts/engine.py
+      - name: Apply patch to pinned official stable
+        run: python3 scripts/engine.py check
