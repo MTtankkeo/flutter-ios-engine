@@ -36,7 +36,7 @@ jobs:
         run: python3 scripts/engine.py prepare
       - name: Build iOS and matching host engine
         run: python3 scripts/engine.py build
-      - name: Package and build unsigned smoke app with packaged engine
+      - name: Package runtime artifacts and free build objects
         run: python3 scripts/engine.py package
       - uses: actions/upload-artifact@v4
         with:
@@ -44,6 +44,8 @@ jobs:
           path: dist/*
           compression-level: 0
           if-no-files-found: error
+      - name: Build unsigned smoke app with packaged engine
+        run: python3 scripts/engine.py smoke
       - name: Publish immutable release
         if: github.event_name == 'push' || inputs.publish
         env:

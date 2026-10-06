@@ -1,9 +1,51 @@
 import tempfile
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import engine
+
+
+class PackageTest(unittest.TestCase):
+    def test_stage_keeps_runtime_files_without_nested_objects_or_tests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            for relative in ("dart-sdk/bin/dart", "clang_x64/gen_snapshot",
+                             "clang_x64/obj/huge.o", "obj/huge.o",
+                             "shell_unittests", "gen/dart-pkg/sky_engine/lib/sky.dart",
+                             "gen/unrelated/huge.dat"):
+                file = source / relative
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_bytes(b"fixture")
+            destination = base / "stage"
+            engine.stage_output(source, destination)
+            self.assertTrue((destination / "clang_x64/gen_snapshot").is_file())
+            self.assertTrue((destination / "gen/dart-pkg/sky_engine/lib/sky.dart").is_file())
+            self.assertFalse((destination / "clang_x64/obj").exists())
+            self.assertFalse((destination / "obj").exists())
+            self.assertFalse((destination / "shell_unittests").exists())
+            self.assertFalse((destination / "gen/unrelated").exists())
+            self.assertTrue(os.path.samefile(source / "dart-sdk/bin/dart",
+                                            destination / "dart-sdk/bin/dart"))
+
+    def test_cleanup_removes_only_generated_objects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            src = Path(temporary)
+            for name in (engine.HOST, engine.TARGET):
+                output = src / "out" / name
+                for relative in ("obj/large.o", "clang_x64/obj/large.o", "clang_x64/gen_snapshot"):
+                    file = output / relative
+                    file.parent.mkdir(parents=True, exist_ok=True)
+                    file.write_bytes(b"fixture")
+            with patch.object(engine, "SRC", src):
+                engine.clean_objects()
+            for name in (engine.HOST, engine.TARGET):
+                output = src / "out" / name
+                self.assertFalse((output / "obj").exists())
+                self.assertFalse((output / "clang_x64/obj").exists())
+                self.assertTrue((output / "clang_x64/gen_snapshot").is_file())
 
 
 class BuildTest(unittest.TestCase):

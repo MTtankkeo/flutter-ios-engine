@@ -92,10 +92,58 @@ def build():
 
 def copy(source, destination):
     if source.is_dir():
-        shutil.copytree(source, destination, symlinks=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination, symlinks=True, copy_function=os.link)
     else:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        os.link(source, destination)
+
+
+def stage_output(source, destination):
+    """Ship runtime inputs only, never an entire compiler/toolchain directory."""
+    destination.mkdir(parents=True)
+    runtime_names = (
+        "dart-sdk", "font-subset", "impellerc", "shader_lib", "flutter_tester", "libtessellator.dylib",
+        "frontend_server.dart.snapshot", "Flutter.xcframework", "Flutter.framework",
+        "Flutter.framework.dSYM", "icudtl.dat", "flutter_patched_sdk",
+        "flutter_patched_sdk_product", "LICENSE",
+    )
+    for name in runtime_names:
+        if (source / name).exists():
+            copy(source / name, destination / name)
+    for relative in ("gen/dart-pkg", "gen/flutter/lib/snapshot", "gen/const_finder.dart.snapshot"):
+        if (source / relative).exists():
+            copy(source / relative, destination / relative)
+    for binary in source.rglob("gen_snapshot*"):
+        relative = binary.relative_to(source)
+        if "obj" in relative.parts or "gen" in relative.parts:
+            continue
+        if binary.is_file() and binary.name in (
+            "gen_snapshot", "gen_snapshot_arm64", "gen_snapshot_x64", "gen_snapshot_product"
+        ):
+            copy(binary, destination / relative)
+
+
+def clean_objects():
+    """Only remove generated object directories under our two build outputs."""
+    out = (SRC / "out").resolve()
+    for name in (HOST, TARGET):
+        output = (out / name).resolve()
+        if not output.is_relative_to(out):
+            raise RuntimeError("Build output escaped the workspace")
+        for objects in sorted(output.rglob("obj"), key=lambda p: len(p.parts), reverse=True):
+            if objects.is_symlink() or not objects.resolve().is_relative_to(output):
+                raise RuntimeError("Refusing to remove objects outside the build output")
+            if objects.is_dir():
+                shutil.rmtree(objects)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def package():
@@ -105,18 +153,7 @@ def package():
     for name in (HOST, TARGET):
         source = SRC / "out" / name
         destination = stage / "engine/src/out" / name
-        destination.mkdir(parents=True)
-        # Keep runtime artifacts, omitting object files and build-system state.
-        for item in source.iterdir():
-            if item.name in ("obj", "gen") or item.name.startswith("."):
-                continue
-            if item.suffix in (".ninja", ".o", ".a", ".TOC"):
-                continue
-            copy(item, destination / item.name)
-        for relative in ("gen/dart-pkg", "gen/flutter/lib/snapshot", "gen/const_finder.dart.snapshot"):
-            if (source / relative).exists():
-                (destination / relative).parent.mkdir(parents=True, exist_ok=True)
-                copy(source / relative, destination / relative)
+        stage_output(source, destination)
     host = stage / "engine/src/out" / HOST
     target = stage / "engine/src/out" / TARGET
     # GN emits the release (product) platform into flutter_patched_sdk. Some
@@ -140,31 +177,41 @@ def package():
                     distribution_commit=os.environ.get("GITHUB_SHA", "local"),
                     xcode=subprocess.check_output(["xcodebuild", "-version"], text=True).strip())
     (stage / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    # The staged files share storage with the build outputs. Free objects before
+    # Flutter bootstraps its SDK and before allocating a compressed archive.
+    clean_objects()
+    print("Free disk after object cleanup:", shutil.disk_usage(WORK).free, flush=True)
     dist.mkdir(exist_ok=True)
     basename = f'flutter-{CONFIG["flutter_version"]}-ios-latency.{CONFIG["patch_version"]}'
     archive = dist / (basename + ".tar.gz")
     with tarfile.open(archive, "w:gz") as output:
         for child in stage.iterdir():
             output.add(child, arcname=child.name)
-    checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+    checksum = sha256_file(archive)
     (dist / (archive.name + ".sha256")).write_text(checksum + "  " + archive.name + "\n")
     shutil.copy2(stage / "metadata.json", dist / "metadata.json")
-    # Validate the shipped layout by building an unsigned iOS app against it.
+    print("Packaged archive:", archive)
+
+
+def smoke():
+    stage = WORK / "package"
     app = WORK / "smoke_app"
     run(FLUTTER / "bin/flutter", "create", "--platforms=ios", "--project-name=engine_smoke", app)
     run(FLUTTER / "bin/flutter", "--local-engine-src-path=" + str(stage / "engine/src"),
         "--local-engine=" + TARGET, "--local-engine-host=" + HOST,
         "build", "ios", "--release", "--no-codesign", cwd=app)
-    print("Validated archive:", archive)
+    print("Packaged engine passed unsigned iOS app build")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("check", "prepare", "build", "package"))
+    parser.add_argument("command", choices=("check", "prepare", "build", "package", "smoke"))
     command = parser.parse_args().command
     if command in ("check", "prepare"):
         prepare(sync=command == "prepare")
     elif command == "build":
         build()
-    else:
+    elif command == "package":
         package()
+    else:
+        smoke()

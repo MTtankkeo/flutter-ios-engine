@@ -42,7 +42,9 @@ flutter --local-engine-src-path="$PWD/custom-engine/engine/src" \
 - 자동 검증: stable 출처/커밋 확인 → patch 적용 → iOS/host 컴파일 → 배포할 파일로 unsigned iOS 앱 빌드.
 - 실제 지연 개선과 화면 동작은 실기기에서 별도로 확인해야 합니다.
 
-로컬 빌드: Apple Silicon Mac + Xcode + depot_tools를 준비하고 `python3 scripts/engine.py prepare`, `build`, `package`를 차례로 실행합니다. 새 작업 폴더에서 실행해야 합니다.
+로컬 빌드: Apple Silicon Mac + Xcode + depot_tools를 준비하고 `python3 scripts/engine.py prepare`, `build`, `package`, `smoke`를 차례로 실행합니다. 새 작업 폴더에서 실행해야 합니다.
+
+컴파일 결과는 샘플 앱 검증 전에 Actions artifact로 보존됩니다. 검증이 실패해도 이 artifact를 내려받을 수 있습니다. GitHub Release는 검증까지 성공한 경우에만 게시합니다. 패키징 시 중간 object 파일을 제거하므로 같은 작업 폴더에서 엔진을 다시 빌드하려면 재컴파일이 필요합니다.
 
 공식 참고: [엔진 환경 설정](https://github.com/flutter/flutter/blob/master/docs/engine/contributing/Setting-up-the-Engine-development-environment.md), [엔진 빌드](https://github.com/flutter/flutter/blob/master/docs/engine/contributing/Compiling-the-engine.md).
 
