@@ -13,4 +13,6 @@ jobs:
       - name: Check scripts
         run: python3 -m py_compile scripts/engine.py
       - name: Apply patch to pinned official stable
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/engine.py check

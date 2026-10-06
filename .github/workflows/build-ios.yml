@@ -26,6 +26,8 @@ jobs:
           git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
           echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
       - name: Prepare stable source and apply patch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/engine.py prepare
       - name: Build iOS and matching host engine
         run: python3 scripts/engine.py build

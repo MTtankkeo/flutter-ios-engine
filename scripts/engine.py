@@ -37,10 +37,14 @@ def prepare(sync=False):
     version = CONFIG["flutter_version"]
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise RuntimeError("Use an exact stable version, without a prerelease suffix")
+    headers = {"User-Agent": "flutter-ios-engine", "Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(
         "https://api.github.com/repos/flutter/flutter/compare/"
         + CONFIG["flutter_commit"] + "...stable",
-        headers={"User-Agent": "flutter-ios-engine", "Accept": "application/vnd.github+json"},
+        headers=headers,
     )
     with urllib.request.urlopen(request, timeout=60) as response:
         comparison = json.load(response)
