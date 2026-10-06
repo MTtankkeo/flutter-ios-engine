@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prepare official stable sources, build, and package local-engine artifacts."""
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -58,10 +59,11 @@ def prepare(sync=False):
     if revision() != CONFIG["flutter_commit"]:
         raise RuntimeError("Flutter tag does not match the pinned commit")
     if sync:
-        shutil.copy2(FLUTTER / "engine/scripts/standard.gclient", FLUTTER / ".gclient")
-        # Avoid downloading Android dependencies for this iOS-only build.
-        with (FLUTTER / ".gclient").open("a") as output:
-            output.write('\nsolutions[0]["custom_vars"] = {"download_android_deps": False}\n')
+        standard = ast.parse((FLUTTER / "engine/scripts/standard.gclient").read_text())
+        solutions = ast.literal_eval(standard.body[0].value)
+        # gclient permits literal assignments, not indexed mutation statements.
+        solutions[0]["custom_vars"] = {"download_android_deps": False}
+        (FLUTTER / ".gclient").write_text("solutions = " + repr(solutions) + "\n")
         run("gclient", "sync", "--no-history", "--revision",
             ".@" + CONFIG["flutter_commit"], cwd=FLUTTER)
         if revision() != CONFIG["flutter_commit"]:
