@@ -21,6 +21,7 @@ def copy(source, destination):
 def stage_output(source, destination):
     """Ship runtime inputs only, never an entire compiler/toolchain directory."""
     destination.mkdir(parents=True)
+    staged_directories = []
     runtime_names = (
         "dart-sdk", "font-subset", "impellerc", "shader_lib", "flutter_tester", "libtessellator.dylib",
         "frontend_server.dart.snapshot", "Flutter.xcframework", "Flutter.framework",
@@ -30,10 +31,17 @@ def stage_output(source, destination):
     for name in runtime_names:
         if (source / name).exists():
             copy(source / name, destination / name)
+            if (source / name).is_dir():
+                staged_directories.append(source / name)
     for relative in ("gen/dart-pkg", "gen/flutter/lib/snapshot", "gen/const_finder.dart.snapshot"):
         if (source / relative).exists():
             copy(source / relative, destination / relative)
+            if (source / relative).is_dir():
+                staged_directories.append(source / relative)
     for binary in source.rglob("gen_snapshot*"):
+        # Whole runtime directories already include their snapshot generators.
+        if any(binary.is_relative_to(directory) for directory in staged_directories):
+            continue
         relative = binary.relative_to(source)
         if "obj" in relative.parts or "gen" in relative.parts:
             continue

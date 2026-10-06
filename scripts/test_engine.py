@@ -15,6 +15,7 @@ class PackageTest(unittest.TestCase):
             base = Path(temporary)
             source = base / "source"
             for relative in ("dart-sdk/bin/dart", "clang_x64/gen_snapshot",
+                             "dart-sdk/bin/utils/gen_snapshot",
                              "clang_x64/obj/huge.o", "obj/huge.o",
                              "shell_unittests", "gen/dart-pkg/sky_engine/lib/sky.dart",
                              "gen/unrelated/huge.dat"):
@@ -31,6 +32,8 @@ class PackageTest(unittest.TestCase):
             self.assertFalse((destination / "gen/unrelated").exists())
             self.assertTrue(os.path.samefile(source / "dart-sdk/bin/dart",
                                             destination / "dart-sdk/bin/dart"))
+            self.assertTrue(os.path.samefile(source / "dart-sdk/bin/utils/gen_snapshot",
+                                            destination / "dart-sdk/bin/utils/gen_snapshot"))
 
     def test_cleanup_removes_only_generated_objects(self):
         with tempfile.TemporaryDirectory() as temporary:
