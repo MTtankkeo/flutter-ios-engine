@@ -1,0 +1,160 @@
+name: Build and release iOS engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Flutter release channel
+        type: choice
+        options:
+          - stable
+          - beta
+        default: stable
+        required: true
+
+      flutter_version:
+        description: Exact Flutter version (beta requires its full .pre version)
+        type: string
+        required: true
+
+      patch_version:
+        description: Patch revision recorded in metadata (positive integer)
+        type: string
+        default: '1'
+        required: true
+
+      release:
+        description: release
+        type: boolean
+        default: true
+
+      profile:
+        description: profile
+        type: boolean
+        default: false
+
+      debug:
+        description: debug
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-engine-release
+  cancel-in-progress: false
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      modes: ${{ steps.select.outputs.modes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs and select modes
+        id: select
+        env:
+          FLUTTER_CHANNEL: ${{ inputs.channel }}
+          FLUTTER_VERSION: ${{ inputs.flutter_version }}
+          PATCH_VERSION: ${{ inputs.patch_version }}
+          BUILD_RELEASE: ${{ inputs.release }}
+          BUILD_PROFILE: ${{ inputs.profile }}
+          BUILD_DEBUG: ${{ inputs.debug }}
+        run: |
+          MODES=$(python3 scripts/engine.py matrix)
+          echo "modes=$MODES" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.mode }}
+    needs: select
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ fromJSON(needs.select.outputs.modes) }}
+    runs-on: macos-15
+    timeout-minutes: 240 # 4 hours
+    env:
+      DEPOT_TOOLS_UPDATE: '0'
+      FLUTTER_CHANNEL: ${{ inputs.channel }}
+      FLUTTER_VERSION: ${{ inputs.flutter_version }}
+      PATCH_VERSION: ${{ inputs.patch_version }}
+      RUNTIME_MODE: ${{ matrix.mode }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate build scripts
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Install depot_tools
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Prepare selected release and apply patch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/engine.py prepare
+
+      - name: Build iOS and matching host engine
+        run: python3 scripts/engine.py build
+
+      - name: Package runtime artifacts and free build objects
+        run: python3 scripts/engine.py package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-engine-${{ matrix.mode }}
+          path: dist/*
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Build unsigned smoke app with packaged engine
+        run: python3 scripts/engine.py smoke
+
+  publish:
+    name: Combine and publish selected modes
+    needs: [select, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      MODES_JSON: ${{ needs.select.outputs.modes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ios-engine-*
+          path: .work/artifacts
+
+      - name: Combine validated engines
+        run: |
+          mapfile -t MODES < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["MODES_JSON"])))')
+          python3 scripts/engine.py combine --modes "${MODES[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-engine
+          path: dist/*
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Publish validated release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(python3 -c 'import json; print(json.load(open("dist/metadata.json"))["flutter_version"])')
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          modes = json.loads(Path("dist/metadata.json").read_text())["modes"]
+          notes = " / ".join(f"{'☑' if mode in modes else '☐'} {mode}" for mode in ("release", "profile", "debug"))
+          Path("release-notes.md").write_text(notes + "\n", encoding="utf-8")
+          PY
+
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --notes-file release-notes.md
